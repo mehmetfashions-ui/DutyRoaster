@@ -1,0 +1,763 @@
+<?php
+namespace PHPMaker2025\YourProject; // <-- change to your namespace
+
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
+
+$PageTitle = "Duty Roster (Users-centric, GET mode)";
+$conn = Conn();
+
+/* Router (GET only) */
+$action = $_GET["action"] ?? "";
+
+/* CSRF (PHPMaker) — allow token via GET as well */
+$checkToken = Config("CHECK_TOKEN") ?? true;
+$tokenNameKey = Config("TOKEN_NAME_KEY");
+$tokenValueKey = Config("TOKEN_VALUE_KEY");
+if ($checkToken && $action) {
+    $tname = $_GET[$tokenNameKey] ?? null;
+    $tval  = $_GET[$tokenValueKey] ?? null;
+    if (!$tname || !$tval || !CheckToken($tval)) {
+        http_response_code(403);
+        WriteJson(["success"=>false,"message"=>"Invalid CSRF token (GET)"]); exit;
+    }
+}
+
+/* helpers */
+function ok($a=[]){ WriteJson(array_merge(["success"=>true],$a)); exit; }
+function err($m){ WriteJson(["success"=>false,"message"=>$m]); exit; }
+function gi($k,$d=0){ return isset($_GET[$k]) && is_numeric($_GET[$k]) ? (int)$_GET[$k] : $d; }
+function gs($k,$d=null){ return isset($_GET[$k]) ? $_GET[$k] : $d; }
+function gj($k){ $s=gs($k,"[]"); $x=json_decode($s,true); return is_array($x)?$x:[]; }
+
+/* ======== API (GET) ======== */
+switch ($action) {
+
+/* Periods */
+case "load_periods": {
+    $rows = $conn->fetchAllAssociative("SELECT RosterPeriodID, PeriodName, StartDate, EndDate, Status FROM dbo.RosterPeriod ORDER BY StartDate DESC");
+    ok(["rows"=>$rows]);
+}
+case "create_period": {
+    $name = trim(gs("PeriodName",""));
+    $sd = gs("StartDate"); $ed = gs("EndDate");
+    if (!$name || !$sd || !$ed) err("Missing PeriodName/StartDate/EndDate");
+    $d1=new \DateTime($sd); $d2=new \DateTime($ed);
+    if ($d1->diff($d2)->days !== 13) err("StartDate..EndDate must be exactly 14 days inclusive.");
+    $conn->executeStatement("INSERT INTO dbo.RosterPeriod(PeriodName,StartDate,EndDate,Weeks,Status) VALUES(?, ?, ?, 2, 'Open')", [$name,$sd,$ed]);
+    ok(["RosterPeriodID"=>$conn->lastInsertId()]);
+}
+
+/* Users & Settings */
+case "load_settings": {
+    $pid = gi("RosterPeriodID",0);
+    if (!$pid) err("Select a period");
+    $p = $conn->fetchAssociative("SELECT StartDate FROM dbo.RosterPeriod WHERE RosterPeriodID=?",[$pid]);
+    if (!$p) err("Invalid period");
+    $start = $p["StartDate"];
+    $rows = $conn->fetchAllAssociative("
+        WITH Latest AS (
+            SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.UserID ORDER BY s.EffectiveFrom DESC) rn
+            FROM dbo.UserSettings s
+            WHERE s.EffectiveFrom <= ?
+        )
+        SELECT a.UserID, a.StaffID, a.FullName, a.Team,
+               ISNULL(l.WeeklyHours,48) WeeklyHours,
+               ISNULL(l.MorningRatio,2) MorningRatio,
+               ISNULL(l.NightRatio,2) NightRatio,
+               l.RatingsJson,
+               l.BCNOC_Rating, l.Playout_Rating, l.General_Rating
+        FROM dbo.vw_ActiveOpsUsers a
+        LEFT JOIN Latest l ON l.UserID = a.UserID AND l.rn = 1
+        WHERE a.IsActive = 1
+        ORDER BY a.FullName", [$start]);
+    ok(["rows"=>$rows,"StartDate"=>$start]);
+}
+case "save_settings": {
+    $pid = gi("RosterPeriodID",0);
+    $data = gj("data");
+    if (!$pid || !is_array($data)) err("Bad request");
+    $p = $conn->fetchAssociative("SELECT StartDate FROM dbo.RosterPeriod WHERE RosterPeriodID=?",[$pid]);
+    if (!$p) err("Invalid period");
+    $start = $p["StartDate"];
+    $conn->beginTransaction();
+    try {
+        foreach ($data as $r) {
+            $uid = (int)($r["UserID"] ?? 0);
+            if ($uid<=0) continue;
+            $wh = (int)($r["WeeklyHours"] ?? 48);
+            $mr = (int)($r["MorningRatio"] ?? 2);
+            $nr = (int)($r["NightRatio"] ?? 2);
+            $json = $r["RatingsJson"] ?? null;
+            $exists = $conn->fetchOne("SELECT 1 FROM dbo.UserSettings WHERE UserID=? AND EffectiveFrom=?",[$uid,$start]);
+            if ($exists) {
+                $conn->executeStatement("UPDATE dbo.UserSettings SET WeeklyHours=?, MorningRatio=?, NightRatio=?, RatingsJson=? WHERE UserID=? AND EffectiveFrom=?",
+                    [$wh,$mr,$nr,$json,$uid,$start]);
+            } else {
+                $conn->executeStatement("INSERT INTO dbo.UserSettings(UserID,EffectiveFrom,WeeklyHours,MorningRatio,NightRatio,RatingsJson) VALUES(?,?,?,?,?,?)",
+                    [$uid,$start,$wh,$mr,$nr,$json]);
+            }
+        }
+        $conn->commit(); ok();
+    } catch (\Throwable $e) { $conn->rollBack(); err($e->getMessage()); }
+}
+
+/* Preferences */
+case "load_prefs": {
+    $pid = gi("RosterPeriodID",0);
+    if (!$pid) err("Select a period");
+    $p = $conn->fetchAssociative("SELECT StartDate, EndDate FROM dbo.RosterPeriod WHERE RosterPeriodID=?",[$pid]);
+    if (!$p) err("Invalid period");
+    $dates=[]; $d1=new \DateTime($p["StartDate"]); $d2=new \DateTime($p["EndDate"]);
+    for ($d=clone $d1; $d <= $d2; $d->modify("+1 day")) $dates[]=$d->format("Y-m-d");
+    $users = $conn->fetchAllAssociative("SELECT UserID, StaffID, FullName FROM dbo.vw_ActiveOpsUsers WHERE IsActive=1 ORDER BY FullName");
+    $ph = implode(",", array_fill(0,count($dates), "?"));
+    $prefs = $conn->fetchAllAssociative("SELECT UserID, PrefDate, PrefMorning, PrefNight, PrefOff, PrefLeave FROM dbo.UserDailyPreference WHERE PrefDate IN ($ph)", $dates);
+    ok(["users"=>$users,"dates"=>$dates,"prefs"=>$prefs]);
+}
+case "save_prefs": {
+    $data = gj("data");
+    if (!is_array($data)) err("Bad prefs payload");
+    $conn->beginTransaction();
+    try {
+        foreach ($data as $r) {
+            $uid = (int)($r["UserID"] ?? 0);
+            $dt  = $r["Date"] ?? null;
+            if ($uid<=0 || !$dt) continue;
+            $m = !empty($r["M"])?1:0;
+            $n = !empty($r["N"])?1:0;
+            $o = !empty($r["O"])?1:0;
+            $l = !empty($r["L"])?1:0;
+            if ($l) { $m=0; $n=0; $o=0; }
+            $exists = $conn->fetchOne("SELECT 1 FROM dbo.UserDailyPreference WHERE UserID=? AND PrefDate=?",[$uid,$dt]);
+            if ($exists) {
+                $conn->executeStatement("UPDATE dbo.UserDailyPreference SET PrefMorning=?, PrefNight=?, PrefOff=?, PrefLeave=? WHERE UserID=? AND PrefDate=?",
+                    [$m,$n,$o,$l,$uid,$dt]);
+            } else {
+                $conn->executeStatement("INSERT INTO dbo.UserDailyPreference(UserID,PrefDate,PrefMorning,PrefNight,PrefOff,PrefLeave) VALUES(?,?,?,?,?,?)",
+                    [$uid,$dt,$m,$n,$o,$l]);
+            }
+        }
+        $conn->commit(); ok();
+    } catch (\Throwable $e) { $conn->rollBack(); err($e->getMessage()); }
+}
+
+/* Conflicts & Group */
+case "load_conflicts": {
+    $pairs = $conn->fetchAllAssociative("
+        SELECT p.UserID_A, ua.FullName AS NameA, p.UserID_B, ub.FullName AS NameB
+        FROM dbo.UserConflictPair p
+        JOIN dbo.vw_ActiveOpsUsers ua ON ua.UserID = p.UserID_A
+        JOIN dbo.vw_ActiveOpsUsers ub ON ub.UserID = p.UserID_B
+        ORDER BY NameA, NameB");
+    $gid = $conn->fetchOne("SELECT GroupID FROM dbo.SpecialGroup WHERE GroupName='BCNOC_NightCap'");
+    $gm  = $gid ? $conn->fetchAllAssociative("
+        SELECT m.UserID, u.FullName FROM dbo.SpecialGroupMember m
+        JOIN dbo.vw_ActiveOpsUsers u ON u.UserID = m.UserID
+        WHERE m.GroupID=? ORDER BY u.FullName", [$gid]) : [];
+    $users = $conn->fetchAllAssociative("SELECT UserID, StaffID, FullName FROM dbo.vw_ActiveOpsUsers WHERE IsActive=1 ORDER BY FullName");
+    ok(["pairs"=>$pairs,"groupMembers"=>$gm,"users"=>$users]);
+}
+case "save_conflicts": {
+    $pairs = gj("pairs");
+    $members = gj("groupMembers");
+    $conn->beginTransaction();
+    try {
+        $conn->executeStatement("DELETE FROM dbo.UserConflictPair");
+        foreach ($pairs as $p) {
+            $a = (int)($p["A"]??0); $b=(int)($p["B"]??0);
+            if ($a>0 && $b>0) {
+                if ($a < $b)
+                    $conn->executeStatement("INSERT INTO dbo.UserConflictPair(UserID_A,UserID_B) VALUES(?,?)",[$a,$b]);
+                elseif ($b < $a)
+                    $conn->executeStatement("INSERT INTO dbo.UserConflictPair(UserID_A,UserID_B) VALUES(?,?)",[$b,$a]);
+            }
+        }
+        $gid = $conn->fetchOne("SELECT GroupID FROM dbo.SpecialGroup WHERE GroupName='BCNOC_NightCap'");
+        if (!$gid) { $conn->executeStatement("INSERT INTO dbo.SpecialGroup(GroupName) VALUES('BCNOC_NightCap')"); $gid=$conn->lastInsertId(); }
+        $conn->executeStatement("DELETE FROM dbo.SpecialGroupMember WHERE GroupID=?",[$gid]);
+        foreach ($members as $uid) {
+            $uid=(int)$uid; if ($uid>0) $conn->executeStatement("INSERT INTO dbo.SpecialGroupMember(GroupID,UserID) VALUES(?,?)",[$gid,$uid]);
+        }
+        $conn->commit(); ok();
+    } catch (\Throwable $e) { $conn->rollBack(); err($e->getMessage()); }
+}
+
+/* Generate / Save / Export */
+case "load_generate": {
+    $pid = gi("RosterPeriodID",0);
+    if (!$pid) err("Select period");
+    $p = $conn->fetchAssociative("SELECT StartDate, EndDate FROM dbo.RosterPeriod WHERE RosterPeriodID=?",[$pid]);
+    if (!$p) err("Invalid period");
+    $users = $conn->fetchAllAssociative("SELECT UserID, StaffID, FullName FROM dbo.vw_ActiveOpsUsers WHERE IsActive=1 ORDER BY FullName");
+    $settings = $conn->fetchAllAssociative("
+        WITH Latest AS (
+          SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.UserID ORDER BY s.EffectiveFrom DESC) rn
+          FROM dbo.UserSettings s WHERE s.EffectiveFrom <= ?
+        )
+        SELECT UserID,
+               ISNULL(WeeklyHours,48) WeeklyHours,
+               ISNULL(MorningRatio,2) MorningRatio,
+               ISNULL(NightRatio,2) NightRatio,
+               ISNULL(BCNOC_Rating,TRY_CONVERT(tinyint,JSON_VALUE(RatingsJson,'$.BCNOC'))) BCNOC_Rating,
+               ISNULL(Playout_Rating,TRY_CONVERT(tinyint,JSON_VALUE(RatingsJson,'$.Playout'))) Playout_Rating,
+               ISNULL(General_Rating,TRY_CONVERT(tinyint,JSON_VALUE(RatingsJson,'$.General'))) General_Rating
+        FROM Latest WHERE rn=1", [$p["StartDate"]]);
+    $dates=[]; $d1=new \DateTime($p["StartDate"]); $d2=new \DateTime($p["EndDate"]);
+    for ($d=clone $d1; $d <= $d2; $d->modify("+1 day")) $dates[]=$d->format("Y-m-d");
+    $ph = implode(",", array_fill(0,count($dates), "?"));
+    $prefs = $conn->fetchAllAssociative("SELECT * FROM dbo.UserDailyPreference WHERE PrefDate IN ($ph)", $dates);
+    $pairs = $conn->fetchAllAssociative("SELECT UserID_A, UserID_B FROM dbo.UserConflictPair");
+    $gid = $conn->fetchOne("SELECT GroupID FROM dbo.SpecialGroup WHERE GroupName='BCNOC_NightCap'");
+    $nightCap = $gid ? $conn->fetchFirstColumn("SELECT UserID FROM dbo.SpecialGroupMember WHERE GroupID=?",[$gid]) : [];
+    $shifts = $conn->fetchAllAssociative("
+        SELECT st.ShiftID, st.ShiftName, sc.CategoryName, st.StartTime, st.EndTime, st.LengthHours, st.Priority, st.RequiredCount, st.IsCore
+        FROM dbo.ShiftTemplate st
+        JOIN dbo.ShiftCategory sc ON sc.CategoryID = st.CategoryID
+        ORDER BY st.Priority, st.ShiftID");
+    ok(["period"=>$p,"users"=>$users,"settings"=>$settings,"prefs"=>$prefs,"pairs"=>$pairs,"nightCapGroup"=>$nightCap,"shifts"=>$shifts,"dates"=>$dates]);
+}
+case "save_roster": {
+    $pid = gi("RosterPeriodID",0);
+    $data = gj("data"); // [{UserID,WorkDate,ShiftID}]
+    if (!$pid || !is_array($data)) err("Bad roster payload");
+    $conn->beginTransaction();
+    try {
+        $conn->executeStatement("DELETE FROM dbo.RosterAssignment WHERE RosterPeriodID=?",[$pid]);
+        foreach ($data as $r) {
+            $uid=(int)($r["UserID"]??0); $dt=$r["WorkDate"]??null; $sh=(int)($r["ShiftID"]??0);
+            if ($uid>0 && $dt && $sh>0)
+                $conn->executeStatement("INSERT INTO dbo.RosterAssignment(RosterPeriodID,WorkDate,ShiftID,UserID,CreatedBy) VALUES(?,?,?,?,?)",
+                    [$pid,$dt,$sh,$uid, CurrentUserName() ?: "RosterUI"]);
+        }
+        $conn->commit(); ok();
+    } catch (\Throwable $e) { $conn->rollBack(); err($e->getMessage()); }
+}
+case "export_roster": {
+    $pid = gi("RosterPeriodID",0);
+    if (!$pid) { http_response_code(400); echo "Select period"; exit; }
+    $period = $conn->fetchAssociative("SELECT * FROM dbo.RosterPeriod WHERE RosterPeriodID=?",[$pid]);
+    if (!$period) { http_response_code(404); echo "Invalid period"; exit; }
+
+    $rows = $conn->fetchAllAssociative("
+        SELECT ra.WorkDate, st.ShiftName, sc.CategoryName, v.FullName, v.StaffID, ra.UserID
+        FROM dbo.RosterAssignment ra
+        JOIN dbo.ShiftTemplate st ON st.ShiftID = ra.ShiftID
+        JOIN dbo.ShiftCategory sc ON sc.CategoryID = st.CategoryID
+        JOIN dbo.vw_ActiveOpsUsers v ON v.UserID = ra.UserID
+        WHERE ra.RosterPeriodID=?
+        ORDER BY ra.WorkDate, st.Priority, st.ShiftID, v.FullName", [$pid]);
+
+    $sum = $conn->fetchAllAssociative("SELECT * FROM dbo.vw_RosterSummary WHERE RosterPeriodID=?",[$pid]);
+
+    $wb = new Spreadsheet();
+    $s1 = $wb->getActiveSheet(); $s1->setTitle("Roster");
+    $s1->fromArray(["WorkDate","Shift","Category","FullName","StaffID","UserID"], null, "A1");
+    $r=2; foreach ($rows as $x) { $s1->fromArray([$x["WorkDate"],$x["ShiftName"],$x["CategoryName"],$x["FullName"],$x["StaffID"],$x["UserID"]], null, "A{$r}"); $r++; }
+
+    $s2 = $wb->createSheet(); $s2->setTitle("Summary");
+    $s2->fromArray(["FullName","StaffID","UserID","Week1Hours","Week2Hours","TotalHours","W1 Days","W2 Days"], null, "A1");
+    $r=2; foreach ($sum as $s) { $s2->fromArray([$s["FullName"],$s["StaffID"],$s["UserID"],$s["Week1Hours"],$s["Week2Hours"],$s["TotalHours"],$s["Week1WorkDays"],$s["Week2WorkDays"]], null, "A{$r}"); $r++; }
+
+    $fn = "Roster_" . preg_replace('/\W+/','_', $period["PeriodName"]) . ".xlsx";
+    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    header('Content-Disposition: attachment; filename="'.$fn.'"');
+    (new Xlsx($wb))->save("php://output"); exit;
+}
+
+default:
+    // Render page
+}
+
+/* Render */
+$pageUrl = CurrentPageUrl(false);
+$tokenHtml = ""; $tokenVal = "";
+if ($checkToken) { $tokenVal = CreateToken();
+    $tokenHtml = '<input type="hidden" name="'.$tokenNameKey.'" value="'.HtmlEncode(Config("TOKEN_NAME")).'">'
+               . '<input type="hidden" name="'.$tokenValueKey.'" value="'.HtmlEncode($tokenVal).'">';
+}
+?>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title><?= HtmlTitle($PageTitle) ?></title>
+<?= Css() ?>
+<style>
+.tab-pane{padding-top:1rem}
+.sticky{position:sticky;top:0;background:var(--bs-body-bg);z-index:10;padding:.5rem 0}
+.star{cursor:pointer;font-size:1.1rem;color:#ccc}.star.sel{color:#f0ad4e}
+.pref{width:38px;text-align:center;border:1px solid #e5e5e5;border-radius:.25rem;user-select:none;cursor:pointer}
+.pref.L{background:#ffd6d6;font-weight:600}.pref.M{background:#e6f7ff}.pref.N{background:#fff0e6}.pref.O{background:#e6ffe6}
+.table-fixed thead th{position:sticky;top:0;background:var(--bs-body-bg);z-index:2}
+.small-note{font-size:.84rem;color:#6c757d}
+</style>
+</head>
+<body>
+<div class="container-fluid py-3">
+    <h3 class="mb-3"><?= HtmlEncode($PageTitle) ?></h3>
+
+    <ul class="nav nav-tabs">
+        <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#t1">1) Period</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#t2">2) Users & Settings</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#t3">3) Preferences</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#t4">4) Conflicts</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#t5">5) Generate & Review</button></li>
+    </ul>
+
+    <div class="tab-content">
+
+        <!-- Period -->
+        <div class="tab-pane fade show active" id="t1">
+            <div class="row g-2 align-items-end mt-3">
+                <?= $tokenHtml ?>
+                <div class="col-sm-4">
+                    <label class="form-label">Select Period</label>
+                    <select id="selPeriod" class="form-select"></select>
+                </div>
+                <div class="col-auto"><button class="btn btn-outline-primary" id="btnLoadPeriods">Reload</button></div>
+                <div class="col-12"><hr></div>
+                <div class="col-sm-4"><label class="form-label">New Period Name</label><input id="PeriodName" class="form-control" placeholder="Wk 41–42 / 2025"></div>
+                <div class="col-sm-2"><label class="form-label">Start (Mon)</label><input id="StartDate" type="date" class="form-control"></div>
+                <div class="col-sm-2"><label class="form-label">End (Sun)</label><input id="EndDate" type="date" class="form-control"></div>
+                <div class="col-auto"><button class="btn btn-success" id="btnCreatePeriod">Create</button></div>
+                <div class="col-12 small-note">Must span exactly 14 days inclusive.</div>
+            </div>
+        </div>
+
+        <!-- Users & Settings -->
+        <div class="tab-pane fade" id="t2">
+            <div class="sticky d-flex gap-2">
+                <button class="btn btn-primary" id="btnLoadSettings">Load</button>
+                <button class="btn btn-success" id="btnSaveSettings">Save</button>
+            </div>
+            <div class="table-responsive mt-2">
+                <table class="table table-sm align-middle table-fixed" id="tblSettings">
+                    <thead><tr>
+                        <th>Full Name</th><th>StaffID</th><th>UserID</th>
+                        <th class="text-center">Weekly Hours</th>
+                        <th class="text-center">Morning</th>
+                        <th class="text-center">Night</th>
+                        <th class="text-center">BCNOC ★</th>
+                        <th class="text-center">Playout ★</th>
+                        <th class="text-center">General ★</th>
+                    </tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Preferences -->
+        <div class="tab-pane fade" id="t3">
+            <div class="sticky d-flex gap-2">
+                <button class="btn btn-primary" id="btnLoadPrefs">Load</button>
+                <button class="btn btn-success" id="btnSavePrefs">Save</button>
+            </div>
+            <div id="prefsGrid" class="mt-2"></div>
+        </div>
+
+        <!-- Conflicts -->
+        <div class="tab-pane fade" id="t4">
+            <div class="sticky d-flex gap-2">
+                <button class="btn btn-primary" id="btnLoadConf">Load</button>
+                <button class="btn btn-success" id="btnSaveConf">Save</button>
+            </div>
+            <div class="row g-3 mt-1">
+                <div class="col-md-6">
+                    <h6>Pair Conflicts (cannot work same day)</h6>
+                    <div class="d-flex gap-2 mb-2">
+                        <select id="pairA" class="form-select"></select>
+                        <select id="pairB" class="form-select"></select>
+                        <button class="btn btn-outline-primary" id="btnAddPair">Add</button>
+                    </div>
+                    <ul id="pairList" class="list-group small"></ul>
+                </div>
+                <div class="col-md-6">
+                    <h6>Special Group: BCNOC Night Cap (≤ 2 per night across BCNOC/Playout)</h6>
+                    <div class="d-flex gap-2 mb-2">
+                        <select id="groupAdd" class="form-select"></select>
+                        <button class="btn btn-outline-primary" id="btnAddGroupMember">Add</button>
+                    </div>
+                    <ul id="groupList" class="list-group small"></ul>
+                </div>
+            </div>
+        </div>
+
+        <!-- Generate & Review -->
+        <div class="tab-pane fade" id="t5">
+            <div class="sticky d-flex gap-2">
+                <button class="btn btn-primary" id="btnLoadAll">Load Data</button>
+                <button class="btn btn-warning" id="btnGenerate">Generate</button>
+                <button class="btn btn-success" id="btnSaveRoster">Save to DB</button>
+                <form method="get" action="<?= CurrentPageUrl(false) ?>" class="ms-auto">
+                    <?= $tokenHtml ?>
+                    <input type="hidden" name="action" value="export_roster">
+                    <input type="hidden" name="RosterPeriodID" id="ExportRosterPeriodID">
+                    <button class="btn btn-outline-secondary">Export XLSX</button>
+                </form>
+            </div>
+            <div id="rosterTables" class="mt-2"></div>
+            <h6 class="mt-3">Summary</h6>
+            <div id="summaryTable"></div>
+        </div>
+    </div>
+</div>
+
+<?= Js() ?>
+<script>
+const pageUrl = <?= json_encode(CurrentPageUrl(false)) ?>;
+const tokenNameKey = <?= json_encode($tokenNameKey) ?>;
+const tokenValueKey = <?= json_encode($tokenValueKey) ?>;
+const tokenValue = <?= json_encode(isset($tokenVal)?$tokenVal:"") ?>;
+
+/* GET helper */
+function get(action, params={}) {
+  const q = new URLSearchParams();
+  q.set("action", action);
+  if (tokenValue) { q.set(tokenNameKey, <?= json_encode(Config("TOKEN_NAME")) ?>); q.set(tokenValueKey, tokenValue); }
+  for (const [k,v] of Object.entries(params)) {
+    q.set(k, typeof v === "string" ? v : JSON.stringify(v));
+  }
+  const url = pageUrl + "?" + q.toString();
+  return fetch(url).then(r => action==="export_roster" ? r : r.json());
+}
+const byId = id => document.getElementById(id);
+function star(value=3){ let s=""; for(let i=1;i<=5;i++) s+=`<span class="star ${i<=value?'sel':''}" data-v="${i}">★</span>`; return `<div class="stars" data-value="${value}">${s}</div>`; }
+function shortName(n){ const p=(n||"").trim().split(/\s+/); return p.length>=2?(p[0][0]+p[1][0]).toUpperCase():(n||"").slice(0,2).toUpperCase(); }
+
+/* Period */
+async function loadPeriods(){
+  const rs = await get("load_periods"); if(!rs.success) return alert(rs.message||"Failed");
+  const sel = byId("selPeriod"); sel.innerHTML="";
+  rs.rows.forEach(r => sel.add(new Option(`${r.PeriodName} (${r.StartDate}→${r.EndDate})`, r.RosterPeriodID)));
+  byId("ExportRosterPeriodID").value = sel.value;
+}
+byId("btnLoadPeriods").addEventListener("click", loadPeriods);
+byId("btnCreatePeriod").addEventListener("click", async ()=>{
+  const rs = await get("create_period",{PeriodName:byId("PeriodName").value.trim(),StartDate:byId("StartDate").value,EndDate:byId("EndDate").value});
+  if(!rs.success) return alert(rs.message||"Create failed"); await loadPeriods(); byId("selPeriod").value = rs.RosterPeriodID; byId("ExportRosterPeriodID").value = rs.RosterPeriodID;
+});
+byId("selPeriod").addEventListener("change",()=> byId("ExportRosterPeriodID").value = byId("selPeriod").value);
+
+/* Users & Settings */
+byId("btnLoadSettings").addEventListener("click", async ()=>{
+  const pid = byId("selPeriod").value; if(!pid) return alert("Select period");
+  const rs = await get("load_settings",{RosterPeriodID:pid}); if(!rs.success) return alert(rs.message||"Load failed");
+  const tb = document.querySelector("#tblSettings tbody"); tb.innerHTML="";
+  rs.rows.forEach(r=>{
+    const tr=document.createElement("tr"); tr.dataset.userid=r.UserID;
+    tr.innerHTML = `
+      <td>${r.FullName||""}</td>
+      <td><code>${r.StaffID||""}</code></td>
+      <td><code>${r.UserID}</code></td>
+      <td class="text-center"><input class="form-control form-control-sm text-center" type="number" min="1" max="84" value="${r.WeeklyHours??48}"></td>
+      <td class="text-center"><input class="form-control form-control-sm text-center" type="number" min="0" max="10" value="${r.MorningRatio??2}"></td>
+      <td class="text-center"><input class="form-control form-control-sm text-center" type="number" min="0" max="10" value="${r.NightRatio??2}"></td>
+      <td class="text-center" data-cat="BCNOC">${star(r.BCNOC_Rating??3)}</td>
+      <td class="text-center" data-cat="Playout">${star(r.Playout_Rating??3)}</td>
+      <td class="text-center" data-cat="General">${star(r.General_Rating??3)}</td>`;
+    tb.appendChild(tr);
+  });
+  tb.querySelectorAll(".stars").forEach(div=>{
+    div.addEventListener("click", e=>{
+      const st=e.target.closest(".star"); if(!st) return;
+      const v=parseInt(st.dataset.v,10); div.dataset.value=v;
+      div.querySelectorAll(".star").forEach((x,i)=> x.classList.toggle("sel", i < v));
+    });
+  });
+});
+byId("btnSaveSettings").addEventListener("click", async ()=>{
+  const pid = byId("selPeriod").value; if(!pid) return alert("Select period");
+  const payload=[];
+  document.querySelectorAll("#tblSettings tbody tr").forEach(tr=>{
+    const UserID=+tr.dataset.userid;
+    const WeeklyHours=+tr.children[3].querySelector("input").value||48;
+    const MorningRatio=+tr.children[4].querySelector("input").value||2;
+    const NightRatio=+tr.children[5].querySelector("input").value||2;
+    const ratings={};
+    ["BCNOC","Playout","General"].forEach(cat=>{
+      const v=parseInt(tr.querySelector(`[data-cat="${cat}"] .stars`).dataset.value,10)||3;
+      ratings[cat]=v;
+    });
+    payload.push({UserID,WeeklyHours,MorningRatio,NightRatio,RatingsJson:JSON.stringify(ratings)});
+  });
+  const rs = await get("save_settings",{RosterPeriodID:pid,data:payload}); if(!rs.success) return alert(rs.message||"Save failed");
+  alert("Settings saved.");
+});
+
+/* Preferences */
+let prefModel={users:[],dates:[],map:{}};
+function drawPrefs(){
+  const {users,dates,map}=prefModel;
+  const box=byId("prefsGrid");
+  if(!users.length) return box.innerHTML='<div class="text-muted">No data.</div>';
+  let html = `<div class="table-responsive"><table class="table table-sm table-bordered align-middle">
+  <thead><tr><th>Full Name</th><th>StaffID</th><th>UserID</th>${dates.map(d=>`<th class="text-center">${d.slice(5)}</th>`).join("")}</tr></thead><tbody>`;
+  users.forEach(u=>{
+    html += `<tr data-userid="${u.UserID}"><td>${u.FullName}</td><td><code>${u.StaffID||""}</code></td><td><code>${u.UserID}</code></td>`;
+    dates.forEach(dt=>{
+      const v = (map[u.UserID] && map[u.UserID][dt]) || "--";
+      html += `<td class="text-center"><div class="pref ${v}" data-date="${dt}" data-v="${v}">${v}</div></td>`;
+    });
+    html += `</tr>`;
+  });
+  html += `</tbody></table></div><div class="small-note">Click: -- → M → N → O → L → --</div>`;
+  box.innerHTML=html;
+  box.querySelectorAll(".pref").forEach(el=>{
+    el.addEventListener("click",()=>{
+      const seq=["--","M","N","O","L"]; const cur=el.dataset.v||"--";
+      const nxt=seq[(seq.indexOf(cur)+1)%seq.length]; el.dataset.v=nxt; el.textContent=nxt;
+      el.className="pref " + (nxt==="L"?"L":nxt);
+    });
+  });
+}
+byId("btnLoadPrefs").addEventListener("click", async ()=>{
+  const pid=byId("selPeriod").value; if(!pid) return alert("Select period");
+  const rs=await get("load_prefs",{RosterPeriodID:pid}); if(!rs.success) return alert(rs.message||"Load failed");
+  const map={};
+  rs.prefs.forEach(p=>{
+    const v = p.PrefLeave? "L" : ((p.PrefMorning?"M":"")+(p.PrefNight?"N":"")+(p.PrefOff?"O":"")) || "--";
+    map[p.UserID] ||= {}; map[p.UserID][p.PrefDate]=v;
+  });
+  prefModel={users:rs.users,dates:rs.dates,map}; drawPrefs();
+});
+byId("btnSavePrefs").addEventListener("click", async ()=>{
+  const data=[]; document.querySelectorAll("#prefsGrid tr[data-userid]").forEach(tr=>{
+    const uid=+tr.dataset.userid;
+    tr.querySelectorAll(".pref").forEach(cell=>{
+      const dt=cell.dataset.date; const v=cell.dataset.v||"--";
+      data.push({UserID:uid,Date:dt,M:v.includes("M"),N:v.includes("N"),O:v.includes("O"),L:v==="L"});
+    });
+  });
+  const rs=await get("save_prefs",{data}); if(!rs.success) return alert(rs.message||"Save failed");
+  alert("Preferences saved.");
+});
+
+/* Conflicts */
+let allUsers=[], pairs=[], group=[];
+function refreshConfUI(){
+  const pl=byId("pairList"); pl.innerHTML="";
+  pairs.forEach((p,i)=>{
+    const na=(allUsers.find(x=>x.UserID===p.A)||{}).FullName||p.A;
+    const nb=(allUsers.find(x=>x.UserID===p.B)||{}).FullName||p.B;
+    const li=document.createElement("li");
+    li.className="list-group-item d-flex justify-content-between align-items-center";
+    li.innerHTML=`${na} ↔ ${nb} <button class="btn btn-sm btn-outline-danger">Remove</button>`;
+    li.querySelector("button").addEventListener("click",()=>{ pairs.splice(i,1); refreshConfUI(); });
+    pl.appendChild(li);
+  });
+  const gl=byId("groupList"); gl.innerHTML="";
+  group.forEach((uid,i)=>{
+    const nm=(allUsers.find(x=>x.UserID===uid)||{}).FullName||uid;
+    const li=document.createElement("li");
+    li.className="list-group-item d-flex justify-content-between align-items-center";
+    li.innerHTML=`${nm} <button class="btn btn-sm btn-outline-danger">Remove</button>`;
+    li.querySelector("button").addEventListener("click",()=>{ group.splice(i,1); refreshConfUI(); });
+    gl.appendChild(li);
+  });
+}
+byId("btnLoadConf").addEventListener("click", async ()=>{
+  const rs=await get("load_conflicts"); if(!rs.success) return alert(rs.message||"Load failed");
+  allUsers=rs.users; const fill=id=>{ const s=byId(id); s.innerHTML=""; allUsers.forEach(u=> s.add(new Option(`${u.FullName} [${u.StaffID||""}]`,u.UserID))); };
+  fill("pairA"); fill("pairB"); fill("groupAdd");
+  pairs=(rs.pairs||[]).map(p=>({A:p.UserID_A,B:p.UserID_B}));
+  group=(rs.groupMembers||[]).map(m=>m.UserID);
+  refreshConfUI();
+});
+byId("btnAddPair").addEventListener("click",()=>{
+  const A=+byId("pairA").value, B=+byId("pairB").value; if(!A||!B||A===B) return;
+  const key=(x,y)=>x<y?`${x}|${y}`:`${y}|${x}`; const exists=pairs.some(p=>key(p.A,p.B)===key(A,B));
+  if(!exists){ pairs.push({A,B}); refreshConfUI(); }
+});
+byId("btnAddGroupMember").addEventListener("click",()=>{
+  const uid=+byId("groupAdd").value; if(uid && !group.includes(uid)){ group.push(uid); refreshConfUI(); }
+});
+byId("btnSaveConf").addEventListener("click", async ()=>{
+  const rs=await get("save_conflicts",{pairs,groupMembers:group}); if(!rs.success) return alert(rs.message||"Save failed");
+  alert("Conflicts saved.");
+});
+
+/* Generate & Review */
+let gen=null, roster=[];
+byId("btnLoadAll").addEventListener("click", async ()=>{
+  const pid=byId("selPeriod").value; if(!pid) return alert("Select period");
+  const rs=await get("load_generate",{RosterPeriodID:pid}); if(!rs.success) return alert(rs.message||"Load failed");
+  gen=rs; byId("rosterTables").innerHTML='<div class="text-muted">Data loaded. Click Generate.</div>';
+  byId("ExportRosterPeriodID").value = pid;
+});
+byId("btnGenerate").addEventListener("click", ()=>{
+  if(!gen) return alert("Load data first.");
+  roster = generate(gen);
+  renderRoster(gen, roster);
+  renderSummary(gen, roster);
+});
+byId("btnSaveRoster").addEventListener("click", async ()=>{
+  const pid=byId("selPeriod").value; if(!pid) return alert("Select period");
+  if(!roster.length) return alert("Generate first.");
+  const rs=await get("save_roster",{RosterPeriodID:pid,data:roster}); if(!rs.success) return alert(rs.message||"Save failed");
+  alert("Roster saved.");
+});
+
+/* Generator and renderers — same as previous build (client-side) */
+function generate(data){
+  const users = data.users.map(u=>({UserID:u.UserID, StaffID:u.StaffID, Name:u.FullName, Short:shortName(u.FullName)}));
+  const shifts = data.shifts, dates=data.dates;
+  const core = shifts.filter(s=>s.IsCore==1);
+  const general = shifts.find(s=>s.IsCore==0);
+  const settings={}; (data.settings||[]).forEach(s=>settings[s.UserID]=s);
+  const prefs={}; (data.prefs||[]).forEach(p=>{ (prefs[p.UserID] ||= {})[p.PrefDate]={L:!!p.PrefLeave,M:!!p.PrefMorning,N:!!p.PrefNight,O:!!p.PrefOff}; });
+  const pairSet = new Set((data.pairs||[]).map(p => [p.UserID_A,p.UserID_B].sort().join("|")));
+  const nightCap = new Set(data.nightCapGroup||[]);
+  const assigned={}, hours={}, wHours={}, wDays={}, typeW={};
+  users.forEach(u=>{ hours[u.UserID]=0; wHours[u.UserID]={W1:0,W2:0}; wDays[u.UserID]={W1:0,W2:0}; typeW[u.UserID]={W1:{M:0,N:0,G:0}, W2:{M:0,N:0,G:0}}; });
+
+  function isConflict(uid,date,shift){
+    const list=assigned[date]||[];
+    for(const a of list){ if (pairSet.has([uid,a.uid].sort().join("|"))) return true; }
+    if (shift.Priority==3){
+      let cnt = list.filter(x=>nightCap.has(x.uid)).length + (nightCap.has(uid)?1:0);
+      if (cnt>2) return true;
+    }
+    return false;
+  }
+  function hadNightYesterday(uid,date){
+    const i=dates.indexOf(date); if(i<=0) return false;
+    const prev=assigned[dates[i-1]]||[];
+    return prev.some(x=> (shifts.find(s=>s.ShiftID==x.shiftId)||{}).Priority==3 );
+  }
+  function score(uid,date,shift){
+    const st=settings[uid]||{WeeklyHours:48,MorningRatio:2,NightRatio:2,BCNOC_Rating:3,Playout_Rating:3,General_Rating:3};
+    const w = (dates.indexOf(date)<7)?"W1":"W2";
+    const pf=(prefs[uid]||{})[date]||{};
+    if (pf.L || pf.O) return -1;
+    if (shift.Priority==2 && hadNightYesterday(uid,date)) return -1;
+    if (wDays[uid][w] >= 4) return -1;
+    if (isConflict(uid,date,shift)) return -1;
+
+    let sc=0;
+    sc += (4 - wDays[uid][w]) * 10;
+    if (wDays[uid][w]==0) sc += 40;
+    if ((shift.Priority==2 && pf.M) || (shift.Priority==3 && pf.N)) sc += 10;
+    const cat=shift.CategoryName;
+    const r = (cat==="BCNOC") ? (st.BCNOC_Rating||3) : (cat==="Playout" ? (st.Playout_Rating||3) : (st.General_Rating||3));
+    if (shift.IsCore) sc += (r-3)*5;
+    const c2 = (st.WeeklyHours||48)*2; sc += Math.max(0, 1 - (hours[uid]/c2))*5;
+    const mP=st.MorningRatio||2, nP=st.NightRatio||2, tot=mP+nP;
+    if (tot>0){
+      const m=typeW[uid][w].M, n=typeW[uid][w].N;
+      const mI=m+(shift.Priority==2?1:0), nI=n+(shift.Priority==3?1:0);
+      const tI=mI+nI; if (tI>0){ const target=mP/tot, cur=mI/tI; sc += (1-Math.abs(cur-target))*5; }
+    }
+    return sc;
+  }
+
+  // Assign core
+  dates.forEach(dt=>{
+    assigned[dt]=[];
+    const dayShifts=core.slice().sort((a,b)=>a.Priority-b.Priority);
+    for(const sh of dayShifts){
+      let need=sh.RequiredCount;
+      const ranked = users
+        .filter(u=>!assigned[dt].some(x=>x.uid===u.UserID))
+        .map(u=>({uid:u.UserID, val:score(u.UserID,dt,sh)}))
+        .filter(x=>x.val>=0)
+        .sort((a,b)=> b.val - a.val || (hours[a.uid]-hours[b.uid]));
+      for (const c of ranked){
+        if (need<=0) break;
+        assigned[dt].push({uid:c.uid, shiftId:sh.ShiftID});
+        const w=(dates.indexOf(dt)<7)?"W1":"W2";
+        hours[c.uid]+=sh.LengthHours; wHours[c.uid][w]+=sh.LengthHours; wDays[c.uid][w]+=1;
+        if (sh.Priority==2) typeW[c.uid][w].M++; if (sh.Priority==3) typeW[c.uid][w].N++;
+        need--;
+      }
+    }
+  });
+
+  // General duty — one per week to the most underused, on a W.OFF day (not after Night)
+  const generalShift = shifts.find(s=>s.IsCore==0);
+  if (generalShift){
+    ["W1","W2"].forEach(w=>{
+      const range = (w==="W1")?[0,6]:[7,13];
+      const pool = users.slice().sort((a,b)=>{
+        const dA=wDays[a.UserID][w], dB=wDays[b.UserID][w];
+        if (dA!==dB) return dA-dB;
+        const hA=wHours[a.UserID][w], hB=wHours[b.UserID][w];
+        return hA-hB;
+      });
+      for (const u of pool){
+        for (let i=range[0]; i<=range[1]; i++){
+          const dt=dates[i];
+          const pf=(prefs[u.UserID]||{})[dt]||{};
+          const already = assigned[dt].some(x=>x.uid===u.UserID);
+          if (already || pf.L) continue;
+          if (hadNightYesterday(u.UserID, dt)) continue;
+          assigned[dt].push({uid:u.UserID, shiftId:generalShift.ShiftID});
+          const wK=w; wDays[u.UserID][wK]+=1; wHours[u.UserID][wK]+=generalShift.LengthHours; hours[u.UserID]+=generalShift.LengthHours; typeW[u.UserID][wK].G++;
+          break;
+        }
+      }
+    });
+  }
+
+  const out=[];
+  dates.forEach(d=> (assigned[d]||[]).forEach(a=> out.push({UserID:a.uid, WorkDate:d, ShiftID:a.shiftId})));
+  return out;
+}
+
+function renderRoster(data, result){
+  const byDate={}; result.forEach(r=>{ (byDate[r.WorkDate] ||= []).push(r); });
+  const core = data.shifts.filter(s=>s.IsCore==1);
+  const ds=data.dates;
+
+  function names(d, uidList){
+    const map = new Map(data.users.map(u=>[u.UserID, shortName(u.FullName)]));
+    return uidList.map(id=> map.get(id) || id).join(", ");
+  }
+  function colFor(d, shiftId){
+    const uids = (byDate[d]||[]).filter(x=>x.ShiftID===shiftId).map(x=>x.UserID);
+    return names(d, uids);
+  }
+  function leaveCol(d){
+    const uids = (data.prefs||[]).filter(p=>p.PrefDate===d && p.PrefLeave).map(p=>p.UserID);
+    return names(d, uids);
+  }
+  function offCol(d){
+    const on = new Set((byDate[d]||[]).map(x=>x.UserID));
+    const leave = new Set((data.prefs||[]).filter(p=>p.PrefDate===d && p.PrefLeave).map(p=>p.UserID));
+    const offs = data.users.filter(u=> !on.has(u.UserID) && !leave.has(u.UserID)).map(u=> shortName(u.FullName));
+    return offs.join(", ");
+  }
+
+  const mkWeek=(a,b,title)=>{
+    let h=`<div class="table-responsive"><table class="table table-sm table-bordered align-middle"><thead><tr><th>${title}</th>`;
+    core.forEach(s=> h+=`<th>${s.ShiftName.replace("_"," ")}</th>`); h+=`<th>W.OFF</th><th>Leave</th></tr></thead><tbody>`;
+    for(let i=a;i<=b;i++){ const d=ds[i];
+      h+=`<tr><td><strong>${d}</strong></td>`;
+      core.forEach(s=> h+=`<td>${colFor(d,s.ShiftID)}</td>`);
+      h+=`<td>${offCol(d)}</td><td>${leaveCol(d)}</td></tr>`;
+    }
+    h+=`</tbody></table></div>`; return h;
+  };
+  byId("rosterTables").innerHTML = mkWeek(0,6,"Week 1") + "<br>" + mkWeek(7,13,"Week 2");
+}
+function renderSummary(data, result){
+  const len = Object.fromEntries(data.shifts.map(s=>[s.ShiftID, s.LengthHours]));
+  const agg = new Map(data.users.map(u=>[u.UserID,{n:u.FullName, sid:u.StaffID, w1h:0,w2h:0,t:0,d1:0,d2:0}]));
+  result.forEach(r=>{
+    const i = data.dates.indexOf(r.WorkDate); const w1 = i<7; const h = len[r.ShiftID]||0;
+    const a = agg.get(r.UserID); a.t+=h; if (w1){a.w1h+=h; a.d1++;} else {a.w2h+=h; a.d2++;}
+  });
+  let h=`<div class="table-responsive"><table class="table table-sm table-bordered align-middle"><thead><tr>
+    <th>Full Name</th><th>StaffID</th><th>UserID</th><th>Week1 Hours</th><th>Week2 Hours</th><th>Total Hours</th><th>W1 Days</th><th>W2 Days</th></tr></thead><tbody>`;
+  for (const [uid,a] of agg.entries()){
+    h+=`<tr><td>${a.n}</td><td><code>${a.sid||""}</code></td><td><code>${uid}</code></td><td>${a.w1h}</td><td>${a.w2h}</td><td>${a.t}</td><td>${a.d1}</td><td>${a.d2}</td></tr>`;
+  }
+  h+=`</tbody></table></div>`;
+  byId("summaryTable").innerHTML=h;
+}
+
+/* Init */
+loadPeriods();
+</script>
+</body>
+</html>
